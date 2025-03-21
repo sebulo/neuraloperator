@@ -12,6 +12,9 @@ from tltorch.factorized_tensors.core import FactorizedTensor
 from .einsum_utils import einsum_complexhalf
 from .base_spectral_conv import BaseSpectralConv
 from .resample import resample
+from .mixed_precision import (
+    fp16_sr_bit,
+)
 
 tl.set_backend("pytorch")
 use_opt_einsum("optimal")
@@ -281,6 +284,7 @@ class SpectralConv(BaseSpectralConv):
     ):
         super().__init__(device=device)
 
+        print("Initializing SpectralConv with stochastic rounding")
         self.in_channels = in_channels
         self.out_channels = out_channels
 
@@ -334,9 +338,13 @@ class SpectralConv(BaseSpectralConv):
         self.separable = separable
 
         tensor_kwargs = decomposition_kwargs if decomposition_kwargs is not None else {}
-  
-        self.weight_dtype = torch.cfloat # always use complex64 for weight since mixed precision is handled in forward pass
 
+        # Determine weight dtype based on fno_block_precision
+        self.weight_dtype = {
+            "full": torch.cfloat,
+            "half": torch.chalf,
+            "mixed": torch.chalf
+        }.get(fno_block_precision, torch.cfloat)
         
         # Create/init spectral weight tensor with specified precision
         if factorization is None:
@@ -352,7 +360,6 @@ class SpectralConv(BaseSpectralConv):
         self._contract = get_contract_fun(
             self.weight, implementation=implementation, separable=separable
         )
-
         if bias:
             self.bias = nn.Parameter(
                 init_std * torch.randn(*(tuple([self.out_channels]) + (1,) * self.order))
@@ -416,33 +423,37 @@ class SpectralConv(BaseSpectralConv):
             fft_size[-1] = fft_size[-1] // 2 + 1  # Redundant last coefficient in real spatial data
         fft_dims = list(range(-self.order, 0))
 
+        # Apply stochastic rounding when converting to half precision
         if self.fno_block_precision == "half":
-            x = x.half()
+            # Convert input to half precision with stochastic rounding
+            # This will handle complex tensors properly by converting to torch.complex32
+            x = fp16_sr_bit(x)
+            #print(f"x.dtype after fp16_sr_bit: {x.dtype}")
+            
 
         if self.complex_data:
             x = torch.fft.fftn(x, norm=self.fft_norm, dim=fft_dims)
             dims_to_fft_shift = fft_dims
         else: 
             x = torch.fft.rfftn(x, norm=self.fft_norm, dim=fft_dims)
-            # When x is real in spatial domain, the last half of the last dim is redundant.
-            # See :ref:`fft_shift_explanation` for discussion of the FFT shift.
             dims_to_fft_shift = fft_dims[:-1] 
         
         if self.order > 1:
             x = torch.fft.fftshift(x, dim=dims_to_fft_shift)
 
+        # For mixed precision, convert to half with stochastic rounding
         if self.fno_block_precision == "mixed":
-            # if 'mixed', the above fft runs in full precision, but the
-            # following operations run at half precision
-            x = x.chalf()
-
+            # Apply stochastic rounding and convert to half precision
+            # This will handle complex tensors properly
+            x = fp16_sr_bit(x)
+            #print(f"x.dtype after fp16_sr_bit: {x.dtype}")
         if self.fno_block_precision in ["half", "mixed"]:
             out_dtype = torch.chalf
         else:
             out_dtype = torch.cfloat
             
         out_fft = torch.zeros([batchsize, self.out_channels, *fft_size],
-                            dtype=out_dtype, device=device)  # Use stored device
+                            dtype=out_dtype, device=device)
         
         # if current modes are less than max, start indexing modes closer to the center of the weight tensor
         starts = [(max_modes - min(size, n_mode)) for (size, n_mode, max_modes) in zip(fft_size, self.n_modes, self.max_n_modes)]
@@ -488,6 +499,8 @@ class SpectralConv(BaseSpectralConv):
             slices_x[-1] = slice(None, weight.shape[-1])
         else:
             slices_x[-1] = slice(None)
+        out_fft = torch.zeros([batchsize, self.out_channels, *fft_size],
+                            dtype=out_dtype, device=device)
         out_fft[slices_x] = self._contract(x[slices_x], weight, separable=self.separable)
         if self.resolution_scaling_factor is not None and output_shape is None:
             mode_sizes = tuple([round(s * r) for (s, r) in zip(mode_sizes, self.resolution_scaling_factor)])
@@ -498,12 +511,18 @@ class SpectralConv(BaseSpectralConv):
         if self.order > 1:
             out_fft = torch.fft.fftshift(out_fft, dim=fft_dims[:-1])
         
+        # Apply inverse FFT
         if self.complex_data:
-            out_fft = torch.fft.ifftn(out_fft, s=mode_sizes, dim=fft_dims, norm=self.fft_norm)
+            out = torch.fft.ifftn(out_fft, s=mode_sizes, dim=fft_dims, norm=self.fft_norm)
         else:
-            out_fft = torch.fft.irfftn(out_fft, s=mode_sizes, dim=fft_dims, norm=self.fft_norm)
+            out = torch.fft.irfftn(out_fft, s=mode_sizes, dim=fft_dims, norm=self.fft_norm)
 
+        # Apply stochastic rounding for complex32 or when converting from half precision
+        #if self.fno_block_precision in ["half", "mixed"]:
+            # Apply stochastic rounding and convert to half precision
+            #out = fp16_sr_bit(out)
+            #print(f"out.dtype after fp16_sr_bit: {out.dtype}")
         if self.bias is not None:
-            out_fft.add_(self.bias)
+            out = out + self.bias
         
-        return out_fft
+        return out
