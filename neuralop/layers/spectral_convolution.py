@@ -334,9 +334,9 @@ class SpectralConv(BaseSpectralConv):
         self.separable = separable
 
         tensor_kwargs = decomposition_kwargs if decomposition_kwargs is not None else {}
-  
-        self.weight_dtype = torch.cfloat # always use complex64 for weight since mixed precision is handled in forward pass
 
+        # Determine weight dtype based on fno_block_precision
+        self.weight_dtype = torch.cfloat # always use complex64 for weight since mixed precision is handled in forward pass
         
         # Create/init spectral weight tensor with specified precision
         if factorization is None:
