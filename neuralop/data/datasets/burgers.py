@@ -126,4 +126,4 @@ def load_mini_burgers_1dtime(data_path: Union[Path, str],
                                    batch_size=test_batch_size,
                                    shuffle=False)}
 
-    return train_loader, test_loaders, burgers_dataset.data_processo
+    return train_loader, test_loaders, burgers_dataset.data_processor

@@ -101,6 +101,7 @@ class FNOBlocks(nn.Module):
         n_layers=1,
         max_n_modes=None,
         fno_block_precision="full",
+        fno_block_weights_precision="full",
         channel_mlp_dropout=0,
         channel_mlp_expansion=0.5,
         non_linearity=F.gelu,
@@ -132,6 +133,7 @@ class FNOBlocks(nn.Module):
 
         self.max_n_modes = max_n_modes
         self.fno_block_precision = fno_block_precision
+        self.fno_block_weights_precision = fno_block_weights_precision
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.n_layers = n_layers
@@ -170,6 +172,7 @@ class FNOBlocks(nn.Module):
                 separable=separable,
                 factorization=factorization,
                 fno_block_precision=fno_block_precision,
+                fno_block_weights_precision=fno_block_weights_precision,
                 decomposition_kwargs=decomposition_kwargs,
                 complex_data=complex_data
             ) 

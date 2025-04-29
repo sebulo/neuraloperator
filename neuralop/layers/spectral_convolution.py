@@ -270,6 +270,7 @@ class SpectralConv(BaseSpectralConv):
         separable=False,
         resolution_scaling_factor: Optional[Union[Number, List[Number]]] = None,
         fno_block_precision="full",
+        fno_block_weights_precision="full",
         rank=0.5,
         factorization=None,
         implementation="reconstructed",
@@ -296,7 +297,10 @@ class SpectralConv(BaseSpectralConv):
             max_n_modes = [max_n_modes]
         self.max_n_modes = max_n_modes
 
+        self.fno_block_weights_precision = fno_block_weights_precision
         self.fno_block_precision = fno_block_precision
+        if fno_block_weights_precision == "half" and fno_block_precision == "full":
+            self.fno_block_precision = "mixed" # design choice. could also go to half
         self.rank = rank
         self.factorization = factorization
         self.implementation = implementation
@@ -335,8 +339,11 @@ class SpectralConv(BaseSpectralConv):
 
         tensor_kwargs = decomposition_kwargs if decomposition_kwargs is not None else {}
 
-        # Determine weight dtype based on fno_block_precision
-        self.weight_dtype = torch.cfloat # always use complex64 for weight since mixed precision is handled in forward pass
+        # Determine weight dtype based on fno_block_weights_precision
+        if fno_block_weights_precision == "half":
+            self.weight_dtype = torch.complex32
+        else:
+            self.weight_dtype = torch.cfloat  # default to complex64
         
         # Create/init spectral weight tensor with specified precision
         if factorization is None:
@@ -347,7 +354,8 @@ class SpectralConv(BaseSpectralConv):
             self.weight = FactorizedTensor.new(weight_shape, rank=self.rank, 
                                      factorization=factorization, fixed_rank_modes=fixed_rank_modes,
                                      **tensor_kwargs, dtype=self.weight_dtype)
-            self.weight.normal_(0, init_std)
+            with torch.no_grad():
+                self.weight.normal_(0, init_std)
         
         self._contract = get_contract_fun(
             self.weight, implementation=implementation, separable=separable
