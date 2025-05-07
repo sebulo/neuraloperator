@@ -1,9 +1,8 @@
-from typing import List, Optional, Tuple, Union
-
 from ..utils import validate_scaling_factor
-
+import numpy as np
 import torch
 from torch import nn
+from torch.autograd import Function
 
 import tensorly as tl
 from tensorly.plugins import use_opt_einsum
@@ -174,7 +173,7 @@ def get_contract_fun(weight, implementation="reconstructed", separable=False):
             f'Got implementation={implementation}, expected "reconstructed" or "factorized"'
         )
 
-
+from typing import List, Optional, Tuple, Union
 Number = Union[int, float]
 
 
@@ -270,7 +269,6 @@ class SpectralConv(BaseSpectralConv):
         separable=False,
         resolution_scaling_factor: Optional[Union[Number, List[Number]]] = None,
         fno_block_precision="full",
-        fno_block_weights_precision="full",
         rank=0.5,
         factorization=None,
         implementation="reconstructed",
@@ -297,10 +295,7 @@ class SpectralConv(BaseSpectralConv):
             max_n_modes = [max_n_modes]
         self.max_n_modes = max_n_modes
 
-        self.fno_block_weights_precision = fno_block_weights_precision
         self.fno_block_precision = fno_block_precision
-        if fno_block_weights_precision == "half" and fno_block_precision == "full":
-            self.fno_block_precision = "mixed" # design choice. could also go to half
         self.rank = rank
         self.factorization = factorization
         self.implementation = implementation
@@ -322,6 +317,7 @@ class SpectralConv(BaseSpectralConv):
                 fixed_rank_modes = None
         self.fft_norm = fft_norm
 
+        
         if factorization is None:
             factorization = "Dense"  # No factorization
 
@@ -339,23 +335,26 @@ class SpectralConv(BaseSpectralConv):
 
         tensor_kwargs = decomposition_kwargs if decomposition_kwargs is not None else {}
 
-        # Determine weight dtype based on fno_block_weights_precision
-        if fno_block_weights_precision == "half":
-            self.weight_dtype = torch.complex32
-        else:
-            self.weight_dtype = torch.cfloat  # default to complex64
+        self.weight_dtype = torch.cfloat # always use complex64 for weight since mixed precision is handled in forward pass
         
+        factorization = None
         # Create/init spectral weight tensor with specified precision
         if factorization is None:
-            self.weight = torch.empty(weight_shape, dtype=self.weight_dtype)
+            self.weight = nn.Parameter(torch.empty(weight_shape, dtype=self.weight_dtype))
             with torch.no_grad():
                 self.weight.normal_(0, init_std)
         else:
+            # For factorized tensors, we need to ensure the factors require gradients
             self.weight = FactorizedTensor.new(weight_shape, rank=self.rank, 
                                      factorization=factorization, fixed_rank_modes=fixed_rank_modes,
                                      **tensor_kwargs, dtype=self.weight_dtype)
-            with torch.no_grad():
-                self.weight.normal_(0, init_std)
+            # Make sure all factors require gradients
+            if hasattr(self.weight, 'factors'):
+                for factor in self.weight.factors:
+                    factor.requires_grad_(True)
+            if hasattr(self.weight, 'core'):
+                self.weight.core.requires_grad_(True)
+            self.weight.normal_(0, init_std)
         
         self._contract = get_contract_fun(
             self.weight, implementation=implementation, separable=separable
@@ -367,9 +366,6 @@ class SpectralConv(BaseSpectralConv):
             )
         else:
             self.bias = None
-            
-        # print precision of weight
-        print("## Weight precision: ", fno_block_weights_precision)
 
     def transform(self, x, output_shape=None):
         in_shape = list(x.shape[2:])
@@ -419,105 +415,257 @@ class SpectralConv(BaseSpectralConv):
         -------
         tensorized_spectral_conv(x)
         """
-        batchsize, channels, *mode_sizes = x.shape
-        device = x.device  # Store device at the start
         
-        fft_size = list(mode_sizes)
-        if not self.complex_data:
-            fft_size[-1] = fft_size[-1] // 2 + 1  # Redundant last coefficient in real spatial data
-        fft_dims = list(range(-self.order, 0))
-
-        if self.fno_block_precision == "half":
-            x = x.half()
-        #check that x is not half precision
-        elif x.dtype == torch.float16:
-            x = x.float() # convert to float32 since it should be at this point
-
-        if self.complex_data:
-            x = torch.fft.fftn(x, norm=self.fft_norm, dim=fft_dims)
-            dims_to_fft_shift = fft_dims
-        else: 
-            x = torch.fft.rfftn(x, norm=self.fft_norm, dim=fft_dims)
-            # When x is real in spatial domain, the last half of the last dim is redundant.
-            # See :ref:`fft_shift_explanation` for discussion of the FFT shift.
-            dims_to_fft_shift = fft_dims[:-1] 
-        
-        if self.order > 1:
-            x = torch.fft.fftshift(x, dim=dims_to_fft_shift)
-
-        if self.fno_block_precision == "mixed":
-            # if 'mixed', the above fft runs in full precision, but the
-            # following operations run at half precision
-            x = x.chalf()
-
-        if self.fno_block_precision in ["half", "mixed"]:
-            out_dtype = torch.chalf
+        if not torch.is_tensor(self.weight):
+            # Convert without breaking the graph.
+            weight = self.weight.to_tensor()
         else:
-            out_dtype = torch.cfloat
+            weight = self.weight
+        # not requires grad
+        if not weight.requires_grad:
+            print("weight requires grad")
+            weight.requires_grad_(True)
+        return SpectralConvFunction.apply(
+            x, weight, self.bias, self.n_modes, self.max_n_modes,
+            self.complex_data, self.fft_norm, self.fno_block_precision,
+            self.order, self.separable, self.resolution_scaling_factor,
+            output_shape, self._contract
+        )
+
+
+class SpectralConvFunction(Function):
+    @staticmethod
+    def forward(ctx, x, weight_tensor, bias, n_modes, max_n_modes, complex_data, fft_norm, 
+                fno_block_precision, order, separable, resolution_scaling_factor, output_shape,
+                contract_fn):
+    
             
-        out_fft = torch.zeros([batchsize, self.out_channels, *fft_size],
-                            dtype=out_dtype, device=device)  # Use stored device
+        # Save tensors and parameters for backward pass
+        ctx.save_for_backward(x, weight_tensor, bias)
+        ctx.n_modes = n_modes
+        ctx.max_n_modes = max_n_modes
+        ctx.complex_data = complex_data
+        ctx.fft_norm = fft_norm
+        ctx.fno_block_precision = fno_block_precision
+        ctx.order = order
+        ctx.separable = separable
+        ctx.resolution_scaling_factor = resolution_scaling_factor
+        ctx.output_shape = output_shape
+        ctx.contract_fn = contract_fn
+
+        batchsize, channels, *mode_sizes = x.shape
+        device = x.device
         
-        # if current modes are less than max, start indexing modes closer to the center of the weight tensor
-        starts = [(max_modes - min(size, n_mode)) for (size, n_mode, max_modes) in zip(fft_size, self.n_modes, self.max_n_modes)]
-        # if contraction is separable, weights have shape (channels, modes_x, ...)
-        # otherwise they have shape (in_channels, out_channels, modes_x, ...)
-        if self.separable: 
-            slices_w = [slice(None)] # channels
+        # Compute FFT size and dimensions
+        fft_size = list(mode_sizes)
+        if not complex_data:
+            fft_size[-1] = fft_size[-1] // 2 + 1
+        fft_dims = list(range(-order, 0))
+
+        # Handle precision
+        if fno_block_precision == "half":
+            x = x.half()
+
+        # Forward FFT
+        if complex_data:
+            x_fft = torch.fft.fftn(x, norm=fft_norm, dim=fft_dims)
+            dims_to_fft_shift = fft_dims
         else:
-            slices_w =  [slice(None), slice(None)] # in_channels, out_channels
-        if self.complex_data:
-            slices_w += [slice(start//2, -start//2) if start else slice(start, None) for start in starts]
+            x_fft = torch.fft.rfftn(x, norm=fft_norm, dim=fft_dims)
+            dims_to_fft_shift = fft_dims[:-1]
+
+        if order > 1:
+            x_fft = torch.fft.fftshift(x_fft, dim=dims_to_fft_shift)
+
+        if fno_block_precision == "mixed":
+            x_fft = x_fft.chalf()
+
+        # Prepare output tensor
+        out_dtype = torch.chalf if fno_block_precision in ["half", "mixed"] else torch.cfloat
+        out_fft = torch.zeros([batchsize, weight_tensor.shape[1], *fft_size], 
+                            dtype=out_dtype, device=device)
+
+        # Mode selection and contraction
+        starts = [(max_modes - min(size, n_mode)) 
+                 for (size, n_mode, max_modes) in zip(fft_size, n_modes, max_n_modes)]
+        
+        if separable:
+            slices_w = [slice(None)]
         else:
-            # The last mode already has redundant half removed in real FFT
-            slices_w += [slice(start//2, -start//2) if start else slice(start, None) for start in starts[:-1]]
+            slices_w = [slice(None), slice(None)]
+            
+        if complex_data:
+            slices_w += [slice(start//2, -start//2) if start else slice(start, None) 
+                        for start in starts]
+        else:
+            slices_w += [slice(start//2, -start//2) if start else slice(start, None) 
+                        for start in starts[:-1]]
             slices_w += [slice(None, -starts[-1]) if starts[-1] else slice(None)]
         
-        weight = self.weight[slices_w]
+        weight_tensor = weight_tensor[slices_w]
 
-        ### Pick the first n_modes modes of FFT signal along each dim
-
-        # if separable conv, weight tensor only has one channel dim
-        if self.separable:
-            weight_start_idx = 1
-        # otherwise drop first two dims (in_channels, out_channels)
-        else:
-            weight_start_idx = 2
-        
-        slices_x =  [slice(None), slice(None)] # Batch_size, channels
-
-        for all_modes, kept_modes in zip(fft_size, list(weight.shape[weight_start_idx:])):
-            # After fft-shift, the 0th frequency is located at n // 2 in each direction
-            # We select n_modes modes around the 0th frequency (kept at index n//2) by grabbing indices
-            # n//2 - n_modes//2  to  n//2 + n_modes//2       if n_modes is even
-            # n//2 - n_modes//2  to  n//2 + n_modes//2 + 1   if n_modes is odd
+        # Select modes for input
+        slices_x = [slice(None), slice(None)]
+        for all_modes, kept_modes in zip(fft_size, list(weight_tensor.shape[2:])):
             center = all_modes // 2
             negative_freqs = kept_modes // 2
-            positive_freqs = kept_modes // 2  + kept_modes % 2
-
-            # this slice represents the desired indices along each dim
+            positive_freqs = kept_modes // 2 + kept_modes % 2
             slices_x += [slice(center - negative_freqs, center + positive_freqs)]
-        
-        if weight.shape[-1] < fft_size[-1]:
-            slices_x[-1] = slice(None, weight.shape[-1])
+
+        if weight_tensor.shape[-1] < fft_size[-1]:
+            slices_x[-1] = slice(None, weight_tensor.shape[-1])
         else:
             slices_x[-1] = slice(None)
-        out_fft[slices_x] = self._contract(x[slices_x], weight, separable=self.separable)
-        if self.resolution_scaling_factor is not None and output_shape is None:
-            mode_sizes = tuple([round(s * r) for (s, r) in zip(mode_sizes, self.resolution_scaling_factor)])
 
-        if output_shape is not None:
-            mode_sizes = output_shape
-        
-        if self.order > 1:
-            out_fft = torch.fft.fftshift(out_fft, dim=fft_dims[:-1])
-        
-        if self.complex_data:
-            out_fft = torch.fft.ifftn(out_fft, s=mode_sizes, dim=fft_dims, norm=self.fft_norm)
+        # Contract
+        if separable:
+            out_fft[slices_x] = torch.einsum('bci...,ci...->bc...', 
+                                           x_fft[slices_x], weight_tensor)
         else:
-            out_fft = torch.fft.irfftn(out_fft, s=mode_sizes, dim=fft_dims, norm=self.fft_norm)
+            out_fft[slices_x] = torch.einsum('bci...,cio...->bco...', 
+                                           x_fft[slices_x], weight_tensor)
 
-        if self.bias is not None:
-            out_fft.add_(self.bias)
+        # Inverse FFT
+        if order > 1:
+            out_fft = torch.fft.fftshift(out_fft, dim=fft_dims[:-1])
+
+        if complex_data:
+            out = torch.fft.ifftn(out_fft, s=mode_sizes, dim=fft_dims, norm=fft_norm)
+        else:
+            out = torch.fft.irfftn(out_fft, s=mode_sizes, dim=fft_dims, norm=fft_norm)
+
+        if bias is not None:
+            out = out + bias
+
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight, bias = ctx.saved_tensors
+
+        n_modes = ctx.n_modes
+        max_n_modes = ctx.max_n_modes
+        complex_data = ctx.complex_data
+        fft_norm = ctx.fft_norm
+        fno_block_precision = ctx.fno_block_precision
+        order = ctx.order
+        separable = ctx.separable
+        contract_fn = ctx.contract_fn
+
+        batchsize, channels, *mode_sizes = x.shape
+        fft_size = list(mode_sizes)
+        if not complex_data:
+            fft_size[-1] = fft_size[-1] // 2 + 1
+        fft_dims = list(range(-order, 0))
+
+        # Compute FFT of grad_output
+        if complex_data:
+            grad_fft = torch.fft.fftn(grad_output, norm=fft_norm, dim=fft_dims)
+        else:
+            grad_fft = torch.fft.rfftn(grad_output, norm=fft_norm, dim=fft_dims)
+
+        dims_to_fft_shift = fft_dims[:-1] if not complex_data else fft_dims
+        if order > 1:
+            grad_fft = torch.fft.fftshift(grad_fft, dim=dims_to_fft_shift)
+
+        # Compute FFT of input
+        if complex_data:
+            x_fft = torch.fft.fftn(x, norm=fft_norm, dim=fft_dims)
+        else:
+            x_fft = torch.fft.rfftn(x, norm=fft_norm, dim=fft_dims)
+
+        if order > 1:
+            x_fft = torch.fft.fftshift(x_fft, dim=dims_to_fft_shift)
+
+        # Mode selection
+        starts = [(max_modes - min(size, n_mode)) 
+                 for (size, n_mode, max_modes) in zip(fft_size, n_modes, max_n_modes)]
         
-        return out_fft
+        if separable:
+            slices_w = [slice(None)]
+        else:
+            slices_w = [slice(None), slice(None)]
+            
+        if complex_data:
+            slices_w += [slice(start//2, -start//2) if start else slice(start, None) 
+                        for start in starts]
+        else:
+            slices_w += [slice(start//2, -start//2) if start else slice(start, None) 
+                        for start in starts[:-1]]
+            slices_w += [slice(None, -starts[-1]) if starts[-1] else slice(None)]
+
+        # Select modes for input
+        slices_x = [slice(None), slice(None)]
+        for all_modes, kept_modes in zip(fft_size, list(weight[slices_w].shape[2:])):
+            center = all_modes // 2
+            negative_freqs = kept_modes // 2
+            positive_freqs = kept_modes // 2 + kept_modes % 2
+            slices_x += [slice(center - negative_freqs, center + positive_freqs)]
+
+        if weight[slices_w].shape[-1] < fft_size[-1]:
+            slices_x[-1] = slice(None, weight[slices_w].shape[-1])
+        else:
+            slices_x[-1] = slice(None)
+
+        # Always compute weight gradient if it's factorized or needs grad
+        if ctx.needs_input_grad[1]:
+            # Create a tensor of the same shape as weight for the gradient
+            grad_weight = torch.zeros_like(weight)
+            
+            # Compute the gradient for the weight
+            if separable:
+                grad_weight[slices_w] = torch.einsum('bci...,bc...->ci...', 
+                                                   x_fft[slices_x], 
+                                                   grad_fft[slices_x].conj() if complex_data else grad_fft[slices_x])
+            else:
+                grad_weight[slices_w] = torch.einsum('bci...,bco...->cio...', 
+                                                   x_fft[slices_x], 
+                                                   grad_fft[slices_x].conj() if complex_data else grad_fft[slices_x])
+            
+            # Modified scaling to prevent vanishing gradients
+            if fft_norm == 'forward':
+                # Scale up instead of down to prevent vanishing gradients
+                scale = np.sqrt(np.prod(mode_sizes))
+                grad_weight = grad_weight * scale
+            elif fft_norm == 'ortho':
+                scale = np.power(np.prod(mode_sizes), 0.25)
+                grad_weight = grad_weight * scale
+            else:  # 'backward'
+                # For backward norm, scale up significantly to match the magnitude of input
+                scale = np.sqrt(np.prod(mode_sizes))
+                grad_weight = grad_weight * scale
+            grad_weight = grad_weight * 100
+
+            # Ensure gradients don't explode
+            max_grad_norm = 1.0
+            if grad_weight.norm() > max_grad_norm:
+                grad_weight = grad_weight * (max_grad_norm / grad_weight.norm())
+
+        # Compute input gradients
+        if ctx.needs_input_grad[0]:
+            grad_x_fft = torch.zeros_like(x_fft)
+            if separable:
+                grad_x_fft[slices_x] = contract_fn(grad_fft[slices_x], 
+                                                 weight[slices_w].conj() if complex_data else weight[slices_w], 
+                                                 separable=separable)
+            else:
+                grad_x_fft[slices_x] = contract_fn(grad_fft[slices_x], 
+                                                 weight[slices_w].conj() if complex_data else weight[slices_w], 
+                                                 separable=separable)
+
+            if order > 1:
+                grad_x_fft = torch.fft.fftshift(grad_x_fft, dim=dims_to_fft_shift)
+
+            if complex_data:
+                grad_x = torch.fft.ifftn(grad_x_fft, s=x.shape[2:], dim=fft_dims, norm=fft_norm)
+            else:
+                grad_x = torch.fft.irfftn(grad_x_fft, s=x.shape[2:], dim=fft_dims, norm=fft_norm)
+        else:
+            grad_x = None
+
+        if bias is not None and ctx.needs_input_grad[2]:
+            grad_bias = grad_output.sum(dim=(0, 2, 3), keepdim=True)
+        else:
+            grad_bias = None
+
+        return grad_x, grad_weight, grad_bias, None, None, None, None, None, None, None, None, None, None
